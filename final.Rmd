@@ -1,0 +1,532 @@
+---
+title: "Sleep Duration and Cholesterol: Evidence from NHIS"
+author: "Dylan Hilton & Isabelle Howerton"
+date: "4/29/2020"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Setup
+
+Load packages needed for the analysis. To install `lodown`, use `devtools::install_github()`.
+
+```{r dependencies, message=FALSE}
+# Install dependencies (uncomment if needed)
+#install.packages(c("tidyverse","devtools","survey","car","RDS"))
+#devtools::install_github("ajdamico/lodown", dependencies = TRUE)
+
+#library(mitools) # if using imputed income
+#library(devtools)
+library(lodown)
+library(survey)
+library(car)
+library(RDS)
+library(tidyverse)
+```
+
+Declare which year to use for the analysis.
+
+```{r study_year}
+study_year = 2017
+```
+
+## Download data
+
+Check whether NHIS data has already been downloaded for the study year. If not, use the [`lodown`](https://github.com/ajdamico/lodown) package to download the datasets and save them as `.rds` files in `<working directory>/data/<study_year>/`.
+
+Then, merge the NHIS datasets using household, family, and person identifiers, `hhx`, `fmx`, and `fpx`. Save the merged dataset as `nhis_<study_year>.rds`.
+
+```{r download, results='hide'}
+if(!file.exists(paste0("nhis_", study_year, ".rds"))) {
+  # (Quietly) check which data are available for study_year
+  invisible(capture.output(
+    nhis_catalog <-
+      get_catalog("nhis", output_dir = "data") %>% filter(year == study_year)
+  ))
+  
+  # Download available data
+  lodown("nhis", nhis_catalog)
+  
+  # Load data
+  familyxx <-
+    read_rds(paste0("data/", study_year, "/familyxx.rds"))
+  househld <-
+    read_rds(paste0("data/", study_year, "/househld.rds"))
+  incmimp <- read_rds(paste0("data/", study_year, "/incmimp.rds"))
+  personsx <-
+    read_rds(paste0("data/", study_year, "/personsx.rds"))
+  samadult <-
+    read_rds(paste0("data/", study_year, "/samadult.rds"))
+  funcdisb <-
+    read_rds(paste0("data/", study_year, "/funcdisb.rds"))
+  paradata <-
+    read_rds(paste0("data/", study_year, "/paradata.rds"))
+  
+  # Merge datasets
+  merged <- househld %>%
+    left_join(familyxx, by = "hhx") %>%
+    left_join(paradata, by = c("hhx", "fmx")) %>%
+    left_join(personsx, by = c("hhx", "fmx")) %>%
+    left_join(samadult, by = c("hhx", "fmx", "fpx")) %>%
+    left_join(funcdisb, by = c("hhx", "fmx", "fpx")) %>%
+    arrange(hhx, fmx, fpx)
+  
+  # Export dataset as .rds
+  write_rds(merged, paste0("nhis_", study_year, ".rds"))
+  
+  # Delete merged objects
+  rm(familyxx,
+     househld,
+     incmimp,
+     personsx,
+     samadult,
+     funcdisb,
+     merged)
+  gc()
+}
+```
+
+## Recode variables
+
+Load `nhis_<study_year>.rds`, and decide which variables to keep for the analysis. Some variables, such as identifiers and survey design information, should not be removed.
+
+Convert variables to factors or integers as needed, keeping in mind that `dplyr::case_when()` returns `NA` if a case doesn't match any recode criteria. Label factor levels according to the [NHIS documentation](https://www.cdc.gov/nchs/nhis/nhis_2017_data_release.htm).
+
+```{r recode}
+sample <- read_rds(paste0("nhis_", study_year, ".rds")) %>%
+  
+  # Decalare which variables to keep, convert to factor, apply recodes
+  transmute(
+    # Merge variables -- do not remove
+    # unique id
+    id = paste0(hhx, fmx, fpx),
+    # household id
+    hhx = as.double(hhx),
+    # family id
+    fmx = as.double(fmx),
+    # person id
+    fpx = as.double(fpx),
+    
+    
+    # Survey design variables -- do not remove
+    # psu (cluster)
+    ppsu = as.integer(ppsu.x),
+    # stratum
+    pstrat = as.integer(pstrat.x),
+    # weight after post-stratification adjustments (for sample adult)
+    wtfa_sa = as.integer(wtfa_sa),
+    # complete/partial/incomplete response
+    outcome1 = outcome1,
+    # sample adult flag
+    astatflg = astatflg,
+    
+    # Analysis variables -- free to change
+    # age
+    age = age_p.x,
+    
+    # sex
+    sex = case_when(sex.x == 1 ~ "Male",
+                    sex.x == 2 ~ "Female") %>% factor(),
+    
+    # race
+    race = case_when(
+      racerpi2.x == 1 ~ "White",
+      racerpi2.x == 2 ~ "Black/African American",
+      racerpi2.x == 3 ~ "AIAN",
+      racerpi2.x == 4 ~ "Asian",
+      racerpi2.x == 6 ~ "Multiple race"
+    ) %>% fct_relevel(),
+    
+    # highest level of education completed
+    education = case_when(
+      educ1 <= 12 ~ "No diploma",
+      educ1 %in% c(13, 14) ~ "High school",
+      educ1 %in% c(15, 16, 17) ~ "Some college or Associate's",
+      educ1 == 18 ~ "Bachelor's degree",
+      educ1 %in% c(19, 20, 21) ~ "Advanced degree"
+    ) %>% factor(),
+    
+    # Respondent reported functional limitation (la1ar) and mentioned a heart
+    # problem as a cause (lahca7)
+    heart_limitation = case_when(
+      la1ar == 2 ~ "No",
+      la1ar == 1 & lahca7 == 1 ~ "Yes",
+      la1ar == 1 & lahca7 == 2 ~ "No",
+    ) %>% factor(),
+    
+    # told to increase physical activity, past 12 m
+    told_increase_pa = case_when(dbhvpay == 1 ~ "Yes",
+                                 dbhvpay == 2 ~ "No") %>% factor(),
+    
+    # told to reduce fat/calories in diet, past 12 m
+    told_improve_diet = case_when(dbhvcly == 1 ~ "Yes",
+                                  dbhvcly == 2 ~ "No") %>% factor(),
+    
+    # ever told high cholesterol
+    high_cholesterol_ever = case_when(chlev == 1 ~ "Yes",
+                                      chlev == 2 ~ "No") %>% factor(),
+    
+    # average hours of sleep in 24-hour period
+    hours_sleep = as.integer(case_when(
+      asisleep %in% c(97, 98, 99) ~ NA_integer_,
+      TRUE ~ as.integer(asisleep)
+    ))
+  ) %>%
+  
+  # Filter out non-responses
+  filter(outcome1 %in% c(201, 203)) %>%
+  
+  # Include only respondents chosen for sample adult interview
+  # Responses are weighted at each stage of sampling -- this exclusion should be fine
+  filter(astatflg == 1) %>%
+  
+  # Add complete-case indicator. Don't drop them, but subset using survey design.
+  mutate(complete = complete.cases(.))
+```
+
+
+## Survey design
+
+Use the [`survey`](https://cran.r-project.org/web/packages/survey/survey.pdf) package to account for the sampling, stratification, and weights from the NHIS design.
+
+```{r survey_design}
+# For all sample adult respondents:
+nhis_design <-
+  svydesign(
+    id = ~ ppsu,
+    strata = ~ pstrat,
+    nest = TRUE,
+    weights = ~ wtfa_sa,
+    data = sample
+  )
+```
+
+An exclusion criteria of this study is reporting a functional limitation attributable to a heart problem. Create a `subset` of `nhis_design` that excludes these respondents.
+
+```{r subset_heart_lim}
+# Subset data to exclude those reporting a limitation:
+no_heart_lim <- subset(nhis_design, heart_limitation == "No")
+```
+
+Using complete cases only, generate Table 1.
+
+```{r n}
+nrow(no_heart_lim$variables)
+```
+
+## Visualize
+
+Use a box plot to visually determine whether there is a difference in the average number of hours slept by high cholesterol status.
+
+```{r visualize}
+# Visualize data
+svyboxplot(
+  hours_sleep ~ high_cholesterol_ever,
+  xlab = "Ever told you have high cholesterol?",
+  ylab = "Average hours of sleep",
+  design = no_heart_lim
+)
+```
+
+At first glance, there isn't a difference in mean hours of sleep between the two groups.
+
+## Test assumptions
+
+### Linearity
+
+Use the Box-Tidwell test to determine whether numeric variables (`hours_sleep` and `age`) meet the linearity assumption.
+
+```{r linearity, warning=FALSE}
+# Add interaction terms of the format IV*log(IV)
+# do for all numeric variables
+no_heart_lim <- update(
+  no_heart_lim,
+  sleep_log_sleep = hours_sleep * log(hours_sleep),
+  age_log_age = age * log(age)
+)
+
+# Box-Tidwell test: a significant result means the assumption is violated and
+# the independent variable should be transformed.
+box_tidwell_sleep <-
+  svyglm(
+    high_cholesterol_ever ~ hours_sleep + sleep_log_sleep,
+    design = no_heart_lim,
+    family = binomial
+  )
+
+box_tidwell_age <-
+  svyglm(high_cholesterol_ever ~ age + age_log_age,
+         design = no_heart_lim,
+         family = binomial)
+
+# Print results
+summary(box_tidwell_sleep)
+summary(box_tidwell_age)
+```
+
+A significant result suggests that both `hours_sleep` and `age` should be transformed. Create `sleep_above_mean`, which categorizes cases as above or below the survey mean for `hours_sleep`, and `age_cat`, which divides `age` into categories.
+
+```{r recode_sleep}
+# Calculate mean hours of sleep
+mean_sleep <-
+  data.frame(svymean(~ hours_sleep, design = no_heart_lim, na.rm = TRUE))[1, 1]
+
+mean_sleep
+
+# Add new variables
+no_heart_lim$variables <- no_heart_lim$variables %>%
+  mutate(
+    # Categorize cases based on mean_sleep
+    sleep_above_mean = case_when(hours_sleep >= mean_sleep ~ TRUE,
+                                 TRUE ~ FALSE),
+    
+    # Categorize cases based on age
+    age_cat = case_when(
+      age <= 34 ~ "18 to 34",
+      between(age, 35, 49) ~ "35 to 49",
+      between(age, 50, 70) ~ "50 to 70",
+      age >= 70 ~ "70+"
+    ) %>% factor()
+  ) 
+```
+
+Examine the distribution of the recoded variables:
+
+```{r recode_check}
+# Plot
+no_heart_lim$variables %>%
+  ggplot(aes(age_cat)) +
+  stat_count() +
+  geom_text(
+    stat = 'count',
+    aes(label = ..count..),
+    color = "white",
+    position = position_stack(vjust = 0.5)
+  ) +
+  theme_minimal()
+
+no_heart_lim$variables %>%
+  ggplot(aes(sleep_above_mean)) +
+  stat_count() +
+  geom_text(
+    stat = 'count',
+    aes(label = ..count..),
+    color = "white",
+    position = position_stack(vjust = 0.5)
+  ) +
+  theme_minimal()
+```
+
+## Fit models
+
+### Make a complete-cases dataset
+
+Exclude any responses with missing information and generate Table 1.
+
+```{r complete_cases}
+complete_cases <- subset(no_heart_lim, complete == TRUE)
+```
+
+### Univariate model: sleep only
+```{r sparse_model, warning=FALSE}
+# Sleep-only model
+sparse_model  <- svyglm(high_cholesterol_ever ~ sleep_above_mean,
+                        design = complete_cases,
+                        family = binomial)
+
+# Odds ratios
+RDS:::summary.svyglm.RDS(sparse_model)
+```
+
+
+### Multivariate model: all covariates
+```{r full_model, warning=FALSE}
+# Model with covariates
+full_model <- svyglm(
+  high_cholesterol_ever ~ sleep_above_mean
+  + age_cat + sex + race + education + told_increase_pa + told_improve_diet,
+  design = complete_cases,
+  family = binomial
+)
+
+# Odds ratios
+RDS:::summary.svyglm.RDS(full_model)
+```
+
+## Test assumptions in the full model
+
+### Influence
+
+Compute dfbetas using `svydiags::svydfbetas()`, and flag influential cases where $DFBETA\geq  \frac{2}{\sqrt{n}}$.
+
+```{r full_model_influence}
+# Calculate dfbetas according to survey design
+dfb <-
+  svydiags::svydfbetas(full_model,
+                       stvar = "pstrat",
+                       clvar = "ppsu",
+                       z = 2)
+
+# Name columns
+dfbs <- data.frame(t(dfb$Dfbetas))
+names(dfbs) <- paste0("dfbs_", names(full_model$coefficients))
+
+# Flag influential observations with any dfbeta >= 2/sqrt(n)
+dfbs <- dfbs %>%
+  mutate(influential = ifelse(rowSums(dfbs >= dfb$cutoff) > 0,
+                              1,
+                              0))
+
+# Join dfbetas to data
+full_model_dfbs <- cbind(full_model$data, dfbs)
+
+# Number of influential observations
+full_model_dfbs %>% group_by(influential) %>% summarize(n())
+```
+
+### Multicollinearity
+
+Compute variance inflation factor using `svydiags::svyvif()`. Calculating VIF while taking into account survey weights takes a long time and can exhaust R's memory limit. For convenience, the pre-calculated values are saved in `vif.rds`. Delete `vif.rds` to force re-calculation.
+
+```{r full_model_multicollinearity}
+if(file.exists("vif.rds")) {
+  
+  # Load the pre-calculated object:
+  vif <- read_rds("vif.rds")
+  
+} else {
+  # If the file is missing, generate vif.rds
+  
+  # Calculate covariance matrix
+  covariance_matrix <-
+    svydiags::Vmat(full_model, stvar = "pstrat", clvar = "ppsu")
+  
+  # Get design matrix
+  model_matrix <-
+    model.matrix(full_model$formula, data = full_model$data)
+  
+  # Calculate VIF
+  vif <-
+    svydiags::svyvif(model_matrix, full_model$weights, covariance_matrix)
+  
+  # Save to file
+  write_rds(vif, "vif.rds")
+  
+  # Free up space
+  rm(covariance_matrix)
+}
+
+# Print results
+vif
+```
+
+No variable has a VIF higher than 1.34, so multicollinearity is not a concern.
+
+# Final model
+
+Fit a final model using all covariates, excluding influential values.
+
+```{r remove_influential}
+# join influential column from full_model_dfbs
+complete_cases$variables <- complete_cases$variables %>%
+  left_join(full_model_dfbs %>% select(id, influential))
+
+# Re-fit model, excluding influential cases
+final_model <- svyglm(
+  high_cholesterol_ever ~ sleep_above_mean
+  + age_cat + sex + race + education + told_increase_pa + told_improve_diet,
+  design = complete_cases,
+  subset = influential == 0,
+  family = binomial
+)
+
+# Get odds ratios and CIs
+RDS:::summary.svyglm.RDS(final_model)
+```
+
+Compare coefficients of the three models:
+
+```{r compare_coef}
+# Compare coefficients with other models
+compareCoefs(sparse_model, full_model, final_model)
+```
+
+# Assess goodness-of-fit
+
+Likelihood ratio tests cannot be used with survey data because the [independence assumption](https://towardsdatascience.com/maximum-likelihood-estimation-explained-normal-distribution-6207b322e47f#2555) of the underlying maximum likelihood estimation is violated. Instead, [Wald tests](https://www.stata.com/support/faqs/statistics/likelihood-ratio-test/) or a [modified Hosmer-Lemeshow test](https://journals.sagepub.com/doi/pdf/10.1177/1536867X0600600106) (not currently implemented in R) should be used.
+
+`car::Anova()` produces type-II Wald tests [by default](https://socialsciences.mcmaster.ca/jfox/Books/Companion/appendices/Appendix-Surveys.pdf) when passed a `svyglm` object.
+
+In this test, the null hypothesis is that the coefficient is zero and failing to reject the null hypothesis suggests that removing the variable will not harm the fit of the model. **In other words, a significant result means we should keep the variable.**
+
+```{r gof}
+# Sleep-only model
+Anova(sparse_model)
+
+# Model with covariates
+Anova(final_model)
+```
+
+# Misc.
+
+```{r table1, include=FALSE}
+complete_cases$variables %>% 
+  group_by(high_cholesterol_ever, sex) %>% 
+  summarize(n = n()) %>% 
+  mutate(pct = round(n/sum(n),2)) %>% 
+  mutate(stats = paste0(n," (",pct,")")) %>% 
+  select(-n,-pct) %>% 
+  spread(high_cholesterol_ever, stats)
+
+complete_cases$variables %>% 
+  group_by(high_cholesterol_ever, age_cat) %>% 
+  summarize(n = n()) %>% 
+  mutate(pct = round(n/sum(n),2)) %>% 
+  mutate(stats = paste0(n," (",pct,")")) %>% 
+  select(-n,-pct) %>% 
+  spread(high_cholesterol_ever, stats)
+
+complete_cases$variables %>% 
+  group_by(high_cholesterol_ever, race) %>% 
+  summarize(n = n()) %>% 
+  mutate(pct = round(n/sum(n),2)) %>% 
+  mutate(stats = paste0(n," (",pct,")")) %>% 
+  select(-n,-pct) %>% 
+  spread(high_cholesterol_ever, stats)
+
+complete_cases$variables %>% 
+  group_by(high_cholesterol_ever, education) %>% 
+  summarize(n = n()) %>% 
+  mutate(pct = round(n/sum(n),2)) %>% 
+  mutate(stats = paste0(n," (",pct,")")) %>% 
+  select(-n,-pct) %>% 
+  spread(high_cholesterol_ever, stats)
+
+complete_cases$variables %>% 
+  group_by(high_cholesterol_ever, told_improve_diet) %>% 
+  summarize(n = n()) %>% 
+  mutate(pct = round(n/sum(n),2)) %>% 
+  mutate(stats = paste0(n," (",pct,")")) %>% 
+  select(-n,-pct) %>% 
+  spread(high_cholesterol_ever, stats)
+
+complete_cases$variables %>% 
+  group_by(high_cholesterol_ever, told_increase_pa) %>% 
+  summarize(n = n()) %>% 
+  mutate(pct = round(n/sum(n),2)) %>% 
+  mutate(stats = paste0(n," (",pct,")")) %>% 
+  select(-n,-pct) %>% 
+  spread(high_cholesterol_ever, stats)
+
+complete_cases$variables %>% 
+  group_by(high_cholesterol_ever, sleep_above_mean) %>% 
+  summarize(n = n()) %>% 
+  mutate(pct = round(n/sum(n),2)) %>% 
+  mutate(stats = paste0(n," (",pct,")")) %>% 
+  select(-n,-pct) %>% 
+  spread(high_cholesterol_ever, stats)
+
+```
